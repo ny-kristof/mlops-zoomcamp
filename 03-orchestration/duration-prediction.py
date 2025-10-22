@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+import os
 import pickle
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -12,11 +14,31 @@ from sklearn.metrics import root_mean_squared_error
 
 import mlflow
 
-mlflow.set_tracking_uri("http://localhost:5000")
-mlflow.set_experiment("nyc-taxi-experiment")
+# Airflow imports (TaskFlow API)
+try:
+    # Airflow 3.x uses airflow.sdk
+    from airflow.sdk import dag as dag_decorator, task, DAG
+    from airflow.sdk.definitions.context import get_current_context
+    from airflow.models import Param
+    AIRFLOW_AVAILABLE = True
+except Exception:
+    # Allow running this file as a plain script without Airflow installed
+    dag_decorator = None
+    task = None
+    get_current_context = None
+    Param = None
+    AIRFLOW_AVAILABLE = False
 
-models_folder = Path('models')
-models_folder.mkdir(exist_ok=True)
+# Resolve directories relative to this file to be safe in Airflow workers
+BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
+DATA_DIR = BASE_DIR / "data"
+MODELS_DIR.mkdir(exist_ok=True, parents=True)
+DATA_DIR.mkdir(exist_ok=True, parents=True)
+
+# MLflow configuration (can be overridden by env vars)
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+MLFLOW_EXPERIMENT_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "nyc-taxi-experiment")
 
 
 
@@ -52,6 +74,10 @@ def create_X(df, dv=None):
 
 
 def train_model(X_train, y_train, X_val, y_val, dv):
+    # Configure MLflow at runtime (parse-safe for Airflow)
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
     with mlflow.start_run() as run:
         train = xgb.DMatrix(X_train, label=y_train)
         valid = xgb.DMatrix(X_val, label=y_val)
@@ -80,9 +106,9 @@ def train_model(X_train, y_train, X_val, y_val, dv):
         rmse = root_mean_squared_error(y_val, y_pred)
         mlflow.log_metric("rmse", rmse)
 
-        with open("models/preprocessor.b", "wb") as f_out:
+        with open(MODELS_DIR / "preprocessor.b", "wb") as f_out:
             pickle.dump(dv, f_out)
-        mlflow.log_artifact("models/preprocessor.b", artifact_path="preprocessor")
+        mlflow.log_artifact(str(MODELS_DIR / "preprocessor.b"), artifact_path="preprocessor")
 
         mlflow.xgboost.log_model(booster, artifact_path="models_mlflow")
 
@@ -108,7 +134,87 @@ def run(year, month):
     return run_id
 
 
+# ---------- Airflow DAG (TaskFlow) ----------
+def _next_year_month(year: int, month: int):
+    """Return the next (year, month)."""
+    if month < 12:
+        return year, month + 1
+    return year + 1, 1
+
+
+if AIRFLOW_AVAILABLE:
+    @dag_decorator(
+        dag_id="nyc_taxi_duration_prediction",
+        description="Train XGBoost model to predict NYC taxi trip duration with MLflow logging",
+        start_date=datetime(2023, 1, 1),
+        schedule=None,  # Trigger manually; you can set to "@monthly" later if desired
+        catchup=False,
+        default_args={"owner": "airflow"},
+        params={
+            "year": Param(2023, type="integer", minimum=2018, maximum=2030),
+            "month": Param(1, type="integer", minimum=1, maximum=12),
+        },
+        tags=["mlops-zoomcamp", "xgboost", "mlflow", "nyc-taxi"],
+    )
+    def duration_prediction_dag():
+        @task
+        def fetch_train() -> str:
+            """Download and prepare train dataframe, save locally, return file path."""
+            ctx = get_current_context()
+            year = int(ctx["params"]["year"])  # type: ignore[index]
+            month = int(ctx["params"]["month"])  # type: ignore[index]
+            df_train = read_dataframe(year=year, month=month)
+            out_path = DATA_DIR / f"train_{year}-{month:02d}.parquet"
+            df_train.to_parquet(out_path, index=False)
+            return str(out_path)
+
+        @task
+        def fetch_val() -> str:
+            """Download and prepare validation dataframe for next month, save locally, return file path."""
+            ctx = get_current_context()
+            year = int(ctx["params"]["year"])  # type: ignore[index]
+            month = int(ctx["params"]["month"])  # type: ignore[index]
+            ny, nm = _next_year_month(year, month)
+            df_val = read_dataframe(year=ny, month=nm)
+            out_path = DATA_DIR / f"val_{ny}-{nm:02d}.parquet"
+            df_val.to_parquet(out_path, index=False)
+            return str(out_path)
+
+        @task
+        def train(train_path: str, val_path: str) -> str:
+            """Train the model using saved datasets; returns MLflow run_id."""
+            df_train = pd.read_parquet(train_path)
+            df_val = pd.read_parquet(val_path)
+
+            X_train, dv = create_X(df_train)
+            X_val, _ = create_X(df_val, dv)
+
+            target = 'duration'
+            y_train = df_train[target].values
+            y_val = df_val[target].values
+
+            run_id = train_model(X_train, y_train, X_val, y_val, dv)
+
+            # Save run_id to file for downstream use
+            with open(BASE_DIR / "run_id.txt", "w") as f:
+                f.write(run_id)
+
+            return run_id
+
+        # Define task graph with sequential execution
+        train_path = fetch_train()
+        val_path = fetch_val()
+        run_id = train(train_path, val_path)
+        
+        # Define task dependencies - sequential chain
+        train_path >> val_path >> run_id
+
+    # Instantiate the DAG - this makes it discoverable by Airflow
+    nyc_taxi_duration_prediction = duration_prediction_dag()
+
+
 if __name__ == "__main__":
+    # Optional: allow local execution as a script (outside Airflow)
     import argparse
 
     parser = argparse.ArgumentParser(description='Train a model to predict taxi trip duration.')
@@ -118,5 +224,5 @@ if __name__ == "__main__":
 
     run_id = run(year=args.year, month=args.month)
 
-    with open("run_id.txt", "w") as f:
+    with open(BASE_DIR / "run_id.txt", "w") as f:
         f.write(run_id)

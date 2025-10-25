@@ -15,3 +15,12 @@ dependencies:
   - xgboost
   - fastparquet
   - boto3
+  - prefect
+  - tqdm
+  - requests
+  - joblib
+  - pyarrow
+  - psycopg
+  - psycopg_binary
+  - evidently
+  - matplotlib
